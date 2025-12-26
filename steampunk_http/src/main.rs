@@ -4,7 +4,7 @@ pub mod error;
 fn main() {
     println!("Hello, world!");
 
-    server::listener::Server::default()
+    server::server_builder::Server::default()
         .port(8080)
         .with_max_size(2048)
         .run()

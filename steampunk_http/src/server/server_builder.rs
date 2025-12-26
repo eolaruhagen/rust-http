@@ -45,7 +45,7 @@ impl Server {
         for byte_stream in listener.incoming() {
             let raw_tcp_stream = byte_stream?;
             thread::spawn(|| {
-                todo!("Handle buffer parsing next!");
+                super::handler::test_handler();
             });
         }
 

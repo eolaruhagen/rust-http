@@ -1,5 +1,5 @@
 http_server_challenge.md
 http_server_guide.md
 
-rust_http/target
-rust_http/Cargo.lock
+steampunk_http/target
+steampunk_http/Cargo.lock
