@@ -1,15 +1,14 @@
-use std::{collections::VecDeque, io::Read, net::TcpStream};
+use std::net::TcpStream;
 
-use crate::server::request::{HttpResponse, SteamPunkResponse};
+pub(super) fn handle(stream: &mut TcpStream, buffsize: usize) {
+    // the Tcp stream is large here, thus we want to pass it in by reference, and we cant necessarily return it bc of hte lifetimes.
+    let mut stream_buffer = vec![0u8; buffsize];
 
-pub(crate) fn test_handler() {
-    println!("pong!");
-}
-
-pub(crate) fn handler(request: &mut TcpStream) {
-    // first pre parse headers such as method, path, and body
-    // and content length
-    let mut buffer = [0; 1024];
-    request.read(&mut buffer);
-    //
+    match std::io::Read::read(stream, &mut stream_buffer) {
+        Ok(_) => {
+            // parse request, and then somehow route to the write handler
+        },
+        Err(e) => {
+        },
+    };
 }

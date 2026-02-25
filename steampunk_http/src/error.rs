@@ -1,10 +1,25 @@
 use std::{io, net::AddrParseError};
 
+#[derive(Debug)]
 pub enum SteamPunkError {
+    ServerError(String),
+}
 
+impl From<ServerError> for SteamPunkError {
+    fn from(e: ServerError) -> Self {
+        SteamPunkError::ServerError(e.msg)
+    }
 }
 
 pub struct HttpError;
+
+impl From<SerializationError> for HttpError {
+    fn from(_: SerializationError) -> Self {
+        HttpError
+    }
+}
+
+pub struct SerializationError;
 
 #[derive(Debug)]
 #[allow(unused)]

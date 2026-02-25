@@ -1,12 +1,7 @@
-use super::handler::handler;
-use crate::error::ServerError;
-use crate::server::handler::test_handler;
-use std::thread;
+use crate::error::{ServerError, SteamPunkError};
 use std::{
     collections::VecDeque,
     net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
-    sync::Mutex,
-    thread::Thread,
 };
 
 const LOCALHOST: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
@@ -34,8 +29,10 @@ impl Server {
         self.port = port;
         self
     }
-    pub fn ip(&mut self, address: &str) -> Result<&mut Self, ServerError> {
-        let ip_addr: IpAddr = address.parse()?;
+    pub fn ip(&mut self, address: &str) -> Result<&mut Self, SteamPunkError> {
+        let ip_addr: IpAddr = address
+            .parse()
+            .map_err(ServerError::from)?;
         self.ip = ip_addr;
         Ok(self)
     }
@@ -52,16 +49,19 @@ impl Server {
         self.workers = num_workers;
     }
 
-    pub fn run(&mut self) -> Result<(), ServerError> {
+    pub fn run(&mut self) -> Result<(), SteamPunkError> {
         let listener = self.bind()?;
 
-        let pool: ThreadPool = ThreadPool::new(self.workers).spawn(self.workers);
+        let pool: ThreadPool = ThreadPool::new().spawn(self.workers);
 
         for stream in listener.incoming() {
-            let stream = stream?;
-            pool.queue_task(stream);
+            match stream {
+                Ok(s) => pool.queue_task(s),
+                Err(e) => {
+                    eprintln!("Failed to accept connection: {e}");
+                },
+            };   
         }
-
         Ok(())
     }
 }
@@ -90,7 +90,7 @@ impl WorkerDequeue {
 }
 
 impl ThreadPool {
-    fn new(workers: usize) -> Self {
+    fn new() -> Self {
         ThreadPool {
             workers_queue: WorkerDequeue::new(),
         }
@@ -107,7 +107,6 @@ impl ThreadPool {
                 println!("Spawning worker {i}");
                 loop {
                     if let Some(mut task) = pool_clone.pop_task() {
-                        test_handler();
                     }
                 }
             });

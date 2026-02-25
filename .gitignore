@@ -3,3 +3,5 @@ http_server_guide.md
 
 steampunk_http/target
 steampunk_http/Cargo.lock
+
+steampunk_test/target
