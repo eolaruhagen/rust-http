@@ -7,7 +7,8 @@ use std::{
 const LOCALHOST: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 
 pub struct Server {
-    max_buffer: u32,
+    max_header_size: u32,
+    max_body_size: u32,
     port: u16,
     ip: IpAddr,
     workers: usize,
@@ -16,7 +17,8 @@ pub struct Server {
 impl Default for Server {
     fn default() -> Self {
         Server {
-            max_buffer: u32::default(),
+            max_header_size: u32::default(),
+            max_body_size: u32::default(),
             port: 8080,
             ip: IpAddr::V4(LOCALHOST),
             workers: 1,
@@ -40,8 +42,12 @@ impl Server {
         let full_addr = format!("{}:{}", self.ip, self.port);
         Ok(TcpListener::bind(full_addr)?)
     }
-    pub fn with_max_size(&mut self, buffsize: u32) -> &mut Self {
-        self.max_buffer = buffsize;
+    pub fn with_max_header_size(&mut self, max_header_size: u32) -> &mut Self {
+        self.max_header_size = max_header_size;
+        self
+    }
+    pub fn with_max_body_size(&mut self, max_body_size: u32) -> &mut Self {
+        self.max_body_size = max_body_size;
         self
     }
 

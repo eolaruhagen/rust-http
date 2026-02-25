@@ -121,7 +121,7 @@ impl HttpMethod {
 }
 
 impl<'a> HttpRequest<'a> {
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, SerializationError>{
+    pub fn from_bytes(bytes: &[u8], max_header_size: u32, max_body_size: u32) -> Result<Self, SerializationError>{
         return Ok(HttpRequest {
             http_version: "HTTP/1.1",
             method: &HttpMethod::GET,
