@@ -19,8 +19,6 @@ impl From<SerializationError> for HttpError {
     }
 }
 
-
-
 /// Errors encountered while parsing a raw HTTP request from bytes.
 /// Each variant maps to a specific HTTP response status code that should be
 /// returned to the client when the error occurs.
@@ -50,17 +48,15 @@ pub enum SerializationError {
 #[derive(Debug)]
 #[allow(unused)]
 pub(crate) struct ServerError {
-    msg: String
+    msg: String,
 }
-
-
 
 /// Implementation for Server Error when building with a specified IP that is Invalid
 /// Invalid IpAddr are `not` supported
-impl From<AddrParseError> for ServerError  {
-    fn from (e: AddrParseError) -> ServerError {
+impl From<AddrParseError> for ServerError {
+    fn from(e: AddrParseError) -> ServerError {
         ServerError {
-            msg: format!("IP Address for type {e}")
+            msg: format!("IP Address for type {e}"),
         }
     }
 }
@@ -70,7 +66,7 @@ impl From<AddrParseError> for ServerError  {
 impl From<io::Error> for ServerError {
     fn from(e: io::Error) -> ServerError {
         ServerError {
-            msg: format!("Unexpected IO Error {e}")
+            msg: format!("Unexpected IO Error {e}"),
         }
     }
 }

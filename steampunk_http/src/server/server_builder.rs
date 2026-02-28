@@ -32,9 +32,7 @@ impl Server {
         self
     }
     pub fn ip(&mut self, address: &str) -> Result<&mut Self, SteamPunkError> {
-        let ip_addr: IpAddr = address
-            .parse()
-            .map_err(ServerError::from)?;
+        let ip_addr: IpAddr = address.parse().map_err(ServerError::from)?;
         self.ip = ip_addr;
         Ok(self)
     }
@@ -65,8 +63,8 @@ impl Server {
                 Ok(s) => pool.queue_task(s),
                 Err(e) => {
                     eprintln!("Failed to accept connection: {e}");
-                },
-            };   
+                }
+            };
         }
         Ok(())
     }
@@ -112,8 +110,7 @@ impl ThreadPool {
             std::thread::spawn(move || {
                 println!("Spawning worker {i}");
                 loop {
-                    if let Some(mut task) = pool_clone.pop_task() {
-                    }
+                    if let Some(mut task) = pool_clone.pop_task() {}
                 }
             });
         }

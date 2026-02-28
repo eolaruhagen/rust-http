@@ -1,5 +1,5 @@
-pub mod server;
 pub mod error;
+pub mod server;
 
 fn main() {
     println!("Hello, world!");

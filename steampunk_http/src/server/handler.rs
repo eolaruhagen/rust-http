@@ -7,8 +7,7 @@ pub(super) fn handle(stream: &mut TcpStream, buffsize: usize) {
     match std::io::Read::read(stream, &mut stream_buffer) {
         Ok(_) => {
             // parse request, and then somehow route to the write handler
-        },
-        Err(e) => {
-        },
+        }
+        Err(e) => {}
     };
 }
