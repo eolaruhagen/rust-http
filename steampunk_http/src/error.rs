@@ -43,6 +43,10 @@ pub enum SerializationError {
     /// The request line does not contain the required three parts:
     /// `method SP request-target SP HTTP-version`. Maps to **400 Bad Request**.
     InvalidRequestLine,
+
+    /// The request body exceeds the server's configured `max_body_size`.
+    /// Maps to **413 Content Too Large** (RFC 9110, Section 15.5.14).
+    BodyTooLarge,
 }
 
 #[derive(Debug)]

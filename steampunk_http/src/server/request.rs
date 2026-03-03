@@ -124,7 +124,7 @@ static HTTP_VERSION_1_0: &str = "HTTP/1.0";
 static HTTP_VERSION_1_1: &str = "HTTP/1.1";
 
 static CRLF: &[u8] = b"\r\n";
-static CRLFS: &'static str = "\r\n";
+static CRLFS: &str = "\r\n";
 static HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
 
 enum HttpMethod {
@@ -160,7 +160,7 @@ impl<'a> ParsedHttpRequest<'a> {
     ) -> Result<Self, SerializationError> {
         let header_end_position = find_header_boundary_position(bytes)?;
 
-        if header_end_position > max_header_size as usize {
+        if header_end_position > max_header_size {
             return Err(SerializationError::HeaderTooLarge);
         }
 
@@ -212,6 +212,15 @@ impl<'a> ParsedHttpRequest<'a> {
                 && !k.eq_ignore_ascii_case("connection")
         });
 
+        // finally extract the body if it exists, everything after the header terminator
+        let body = if contains_body {
+            let body_start = header_end_position + HEADER_TERMINATOR.len();
+            // unwrap safe — validate_http_headers guarantees content_length exists when contains_body is true
+            Some(&bytes[body_start..body_start + content_length.unwrap()])
+        } else {
+            None
+        };
+
         return Ok(ParsedHttpRequest {
             http_version,
             method,
@@ -222,7 +231,7 @@ impl<'a> ParsedHttpRequest<'a> {
             content_type,
             connection,
             headers,
-            body: None,
+            body,
         });
     }
 
@@ -340,7 +349,7 @@ fn extract_http_headers(header_buffer: &[u8]) -> Result<HashMap<&str, &str>, Ser
         };
         let field_value = match parts.get(1) {
             Some(value) => value.trim(), // trim whitespace from the value
-            None => return Err(SerializationError::InvalidBuffer), // header with no value (e.g., "X-Flag:") is valid, treat as empty string
+            None => return Err(SerializationError::InvalidBuffer), // no colon found — malformed header line
         };
         headers.insert(field_name, field_value);
     }
@@ -383,7 +392,7 @@ fn validate_http_headers(
             .map_err(|_| SerializationError::InvalidBuffer)?; // non-integer Content-Length is malformed
         // we can't validate the content length against the body size here because we don't have access to the body bytes in this function, but we can at least validate that it's a valid integer and present if a body exists.
         if content_length > max_body_size {
-            return Err(SerializationError::HeaderTooLarge);
+            return Err(SerializationError::BodyTooLarge);
         }
 
         let true_body_size = buffer.len() - (header_end_position + HEADER_TERMINATOR.len());
