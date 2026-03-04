@@ -22,6 +22,7 @@ impl From<SerializationError> for HttpError {
 /// Errors encountered while parsing a raw HTTP request from bytes.
 /// Each variant maps to a specific HTTP response status code that should be
 /// returned to the client when the error occurs.
+#[derive(Debug)]
 pub enum SerializationError {
     /// The raw byte buffer is malformed — missing CRLF terminators, not valid UTF-8,
     /// or otherwise unparseable as an HTTP message. Maps to **400 Bad Request**.

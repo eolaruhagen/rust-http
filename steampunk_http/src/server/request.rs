@@ -402,3 +402,416 @@ fn validate_http_headers(
     }
     Ok(())
 }
+
+
+/// ALL Request Parsing Test Cases
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const MAX_HEADER_SIZE: usize = 8192; // 8 KB
+    const MAX_BODY_SIZE: usize = 1_048_576; // 1 MB
+
+
+    // Tests for from_bytes asssuming a properly formed HTTP request
+    #[test]
+    fn from_bytes_simple_get() {
+        let raw = b"GET /hello HTTP/1.1\r\nHost: localhost:8080\r\n\r\n";
+
+        let req = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("valid GET request should parse successfully");
+
+        // request-line fields
+        assert!(matches!(req.method, HttpMethod::GET));
+        assert_eq!(req.path, "/hello");
+        assert_eq!(req.query, None);
+        assert_eq!(req.http_version, "HTTP/1.1");
+
+        // well-known headers
+        assert_eq!(req.host, "localhost:8080");
+        assert_eq!(req.content_length, None); // no body → no Content-Length
+        assert_eq!(req.content_type, None);
+        assert_eq!(req.connection, None);
+
+        // no extra headers beyond Host (which was extracted)
+        assert!(req.headers.is_empty());
+
+        // no body
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn from_bytes_post_with_json_body() {
+        let body_str = r#"{"name":"lord_voldemort","admin":true}"#;
+        assert_eq!(body_str.len(), 38); // sanity check so the test stays in sync
+
+        // Build the raw request by concatenating header + body.
+        // Using a Vec<u8> avoids format!() brace-escaping issues.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /api/users?verbose=true HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(b"Content-Type: application/json\r\n");
+        raw.extend_from_slice(format!("Content-Length: {}\r\n", body_str.len()).as_bytes());
+        raw.extend_from_slice(b"Connection: keep-alive\r\n");
+        raw.extend_from_slice(b"\r\n"); // header terminator
+        raw.extend_from_slice(body_str.as_bytes());
+
+        let req = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("valid POST with body should parse successfully");
+
+        // request-line
+        assert!(matches!(req.method, HttpMethod::POST));
+        assert_eq!(req.path, "/api/users");
+        assert_eq!(req.query, Some("verbose=true"));
+        assert_eq!(req.http_version, "HTTP/1.1");
+
+        // well-known headers
+        assert_eq!(req.host, "example.com");
+        assert_eq!(req.content_length, Some(body_str.len()));
+        assert_eq!(req.content_type, Some("application/json"));
+        assert_eq!(req.connection, Some("keep-alive"));
+
+        // remaining headers map should be empty — all headers were well-known
+        assert!(req.headers.is_empty());
+
+        // body
+        assert_eq!(req.body, Some(body_str.as_bytes()));
+    }
+
+    #[test]
+    fn from_bytes_post_with_xml_body() {
+        let body_str = r#"<?xml version="1.0"?><user><name>Erico</name></user>"#;
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /api/users HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(b"Content-Type: application/xml\r\n");
+        raw.extend_from_slice(format!("Content-Length: {}\r\n", body_str.len()).as_bytes());
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(body_str.as_bytes());
+
+        let req = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("valid POST with XML body should parse successfully");
+
+        assert!(matches!(req.method, HttpMethod::POST));
+        assert_eq!(req.content_type, Some("application/xml"));
+        assert_eq!(req.content_length, Some(body_str.len()));
+        assert_eq!(req.body, Some(body_str.as_bytes()));
+    }
+
+    #[test]
+    fn from_bytes_post_with_binary_body() {
+        let body_bytes: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, // .PNG
+            0x0D, 0x0A, 0x1A, 0x0A, // \r\n . \n
+            0x00, 0x00, 0x00, 0x0D, // null bytes + length
+            0xFF, 0xFE, 0xFD, 0xFC, // high bytes, not valid UTF-8
+        ];
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /upload HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(b"Content-Type: image/png\r\n");
+        raw.extend_from_slice(format!("Content-Length: {}\r\n", body_bytes.len()).as_bytes());
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(body_bytes);
+
+        let req = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("valid POST with binary body should parse successfully");
+
+        assert!(matches!(req.method, HttpMethod::POST));
+        assert_eq!(req.content_type, Some("image/png"));
+        assert_eq!(req.content_length, Some(body_bytes.len()));
+        assert_eq!(req.body, Some(body_bytes));
+    }
+
+    #[test]
+    // Test with a properly formed request, with large body and many headers on a GET request. 
+    // Still technicaly valid as GET requests can have bodies. Thus body should be present in the struct
+    // also contains a query in the request target as well.
+    fn from_bytes_large_get_with_body_and_query() {
+        let body_str = "x".repeat(1024); // 1 KB body
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"GET /search?q=rust&page=3&limit=50 HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(b"Content-Type: text/plain\r\n");
+        raw.extend_from_slice(format!("Content-Length: {}\r\n", body_str.len()).as_bytes());
+        raw.extend_from_slice(b"Authorization: Bearer tok_abc123\r\n");
+        raw.extend_from_slice(b"Accept: text/html\r\n");
+        raw.extend_from_slice(b"X-Request-Id: 550e8400-e29b-41d4-a716-446655440000\r\n");
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(body_str.as_bytes());
+
+        let req = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("valid GET with body and query should parse successfully");
+
+        assert!(matches!(req.method, HttpMethod::GET));
+        assert_eq!(req.path, "/search");
+        assert_eq!(req.query, Some("q=rust&page=3&limit=50"));
+
+        assert_eq!(req.host, "example.com");
+        assert_eq!(req.content_length, Some(1024));
+        assert_eq!(req.content_type, Some("text/plain"));
+
+        // non-well-known headers land in the HashMap
+        assert_eq!(req.headers.len(), 3);
+        assert_eq!(req.get_header("Authorization"), Some("Bearer tok_abc123"));
+        assert_eq!(req.get_header("Accept"), Some("text/html"));
+        assert_eq!(
+            req.get_header("X-Request-Id"),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+
+        assert_eq!(req.body, Some(body_str.as_bytes()));
+    }
+
+    #[test]
+    fn from_bytes_options_no_body() {
+        // OPTIONS is commonly used for CORS preflight — no body, just headers.
+        let raw = b"OPTIONS /api/data HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        let req = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("valid OPTIONS request should parse successfully");
+
+        assert!(matches!(req.method, HttpMethod::OPTIONS));
+        assert_eq!(req.path, "/api/data");
+        assert_eq!(req.query, None);
+        assert_eq!(req.host, "example.com");
+        assert!(req.body.is_none());
+        assert_eq!(req.content_length, None);
+    }
+
+    #[test]
+    // Test with a properly formed request, no body and at least one header with "key" : "" (empty value) Which should still be valid
+    // Tests PATCH method parsing too
+    fn from_bytes_empty_but_valid_headers() {
+        // RFC 9110 Section 5.5: field values MAY be empty after trimming.
+        // A header like "X-Empty: \r\n" has an empty string as its value, which is legal.
+        let body_str = r#"{"status":"active"}"#;
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"PATCH /api/users/42 HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(b"Content-Type: application/json\r\n");
+        raw.extend_from_slice(format!("Content-Length: {}\r\n", body_str.len()).as_bytes());
+        raw.extend_from_slice(b"X-Empty: \r\n"); // empty value after trim
+        raw.extend_from_slice(b"X-Also-Empty:\r\n");
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(body_str.as_bytes());
+
+        let req = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("headers with empty values are valid per RFC 9110");
+
+        assert!(matches!(req.method, HttpMethod::PATCH));
+        assert_eq!(req.path, "/api/users/42");
+
+        // empty header values should be stored as empty strings, not None
+        assert_eq!(req.get_header("X-Empty"), Some(""));
+        assert_eq!(req.get_header("X-Also-Empty"), Some(""));
+
+        assert_eq!(req.body, Some(body_str.as_bytes()));
+    }
+
+    #[test]
+    fn from_bytes_update_with_keep_alive() {
+        let body_str = r#"{"email":"new@example.com"}"#;
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"PUT /api/users/7 HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: api.example.com\r\n");
+        raw.extend_from_slice(b"Content-Type: application/json\r\n");
+        raw.extend_from_slice(format!("Content-Length: {}\r\n", body_str.len()).as_bytes());
+        raw.extend_from_slice(b"Connection: keep-alive\r\n");
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(body_str.as_bytes());
+
+        let req = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("valid PUT with keep-alive should parse successfully");
+
+        assert!(matches!(req.method, HttpMethod::PUT));
+        assert_eq!(req.path, "/api/users/7");
+        assert_eq!(req.connection, Some("keep-alive"));
+        assert_eq!(req.body, Some(body_str.as_bytes()));
+    }
+
+    #[test]
+    fn from_bytes_delete_with_query() {
+        let raw = b"DELETE /api/cache?region=us-east HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        let req = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("valid DELETE with query should parse successfully");
+
+        assert!(matches!(req.method, HttpMethod::DELETE));
+        assert_eq!(req.path, "/api/cache");
+        assert_eq!(req.query, Some("region=us-east"));
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn from_bytes_options_with_custom_headers() {
+        // Custom headers should land in the HashMap, not be silently dropped.
+        // Also tests a header value containing a colon — splitn(2, ':') must only
+        // split on the FIRST colon, keeping "10.0.0.1:443" intact in the value.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"OPTIONS /api HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(b"X-Forwarded-For: 10.0.0.1:443\r\n");
+        raw.extend_from_slice(b"X-Correlation-Id: abc-123\r\n");
+        raw.extend_from_slice(b"Accept: */*\r\n");
+        raw.extend_from_slice(b"\r\n");
+
+        let req = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("OPTIONS with custom headers should parse successfully");
+
+        assert!(matches!(req.method, HttpMethod::OPTIONS));
+        assert_eq!(req.headers.len(), 3);
+
+        // colon in value must be preserved — split on first colon only
+        assert_eq!(req.get_header("X-Forwarded-For"), Some("10.0.0.1:443"));
+        assert_eq!(req.get_header("X-Correlation-Id"), Some("abc-123"));
+        assert_eq!(req.get_header("Accept"), Some("*/*"));
+    }
+
+    #[test]
+    /// As per the HTTP 1.1 RFC 7230 duplicate header names are allowed, and should be combined into a single header with CSV values
+    /// Test should ensure thats how they are formed
+    fn from_bytes_with_duplicate_headers() {
+        // RFC 9110 Section 5.3: A recipient MAY combine multiple header fields with
+        // the same name into one "field-name: field-value" pair by appending each
+        // subsequent value separated by a comma.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"GET /resource HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(b"Accept: text/html\r\n");
+        raw.extend_from_slice(b"Accept: application/json\r\n");
+        raw.extend_from_slice(b"\r\n");
+
+        let req = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("duplicate headers should parse (even if combined incorrectly for now)");
+
+        // RFC 9110 Section 5.3: duplicate header values must be combined with ", "
+        assert_eq!(req.get_header("Accept"), Some("text/html, application/json"));
+    }
+
+    #[test]
+    fn from_bytes_enforce_header_names_are_case_insensitive() {
+        // RFC 9110 Section 5.1: field names are case-insensitive.
+        // get_header() must find headers regardless of the casing used in the request
+        // vs. the casing used in the lookup.
+        let body_str = "hello";
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /test HTTP/1.1\r\n");
+        raw.extend_from_slice(b"hOsT: example.com\r\n"); // weird casing for Host
+        raw.extend_from_slice(b"content-type: text/plain\r\n"); // all lowercase
+        raw.extend_from_slice(format!("CONTENT-LENGTH: {}\r\n", body_str.len()).as_bytes()); // ALL CAPS
+        raw.extend_from_slice(b"connection: close\r\n"); // lowercase
+        raw.extend_from_slice(b"x-CUSTOM-Header: some-value\r\n"); // mixed case custom header
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(body_str.as_bytes());
+
+        let req = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("case-insensitive headers should parse successfully");
+
+        // well-known headers extracted despite non-standard casing
+        assert_eq!(req.host, "example.com");
+        assert_eq!(req.content_type, Some("text/plain"));
+        assert_eq!(req.content_length, Some(5));
+        assert_eq!(req.connection, Some("close"));
+
+        // get_header lookups with different casing than what was in the request
+        assert_eq!(req.get_header("HOST"), Some("example.com"));
+        assert_eq!(req.get_header("Content-Type"), Some("text/plain"));
+        assert_eq!(req.get_header("connection"), Some("close"));
+
+        // custom header: stored with original casing, but lookup is case-insensitive
+        assert_eq!(req.get_header("X-Custom-Header"), Some("some-value"));
+        assert_eq!(req.get_header("x-custom-header"), Some("some-value"));
+    }
+
+    // ── Additional RFC-driven edge cases ────────────────────────────────
+
+    #[test]
+    fn from_bytes_http_1_0_with_host() {
+        // HTTP/1.0 (RFC 1945) didn't mandate Host, but our parser requires it
+        // unconditionally. This test documents that design decision:
+        // HTTP/1.0 requests WITH Host are accepted.
+        let raw = b"GET /legacy HTTP/1.0\r\nHost: oldserver.com\r\n\r\n";
+
+        let req = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("HTTP/1.0 with Host should parse successfully");
+
+        assert!(matches!(req.method, HttpMethod::GET));
+        assert_eq!(req.http_version, "HTTP/1.0");
+        assert_eq!(req.host, "oldserver.com");
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn from_bytes_connection_close() {
+        // Connection: close tells the server to tear down the TCP socket after
+        // responding. Semantically distinct from keep-alive — make sure it parses.
+        let raw = b"GET /bye HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+
+        let req = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("Connection: close should parse successfully");
+
+        assert_eq!(req.connection, Some("close"));
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn from_bytes_empty_query_after_question_mark() {
+        // "GET /path? HTTP/1.1" — the '?' is present but nothing follows it.
+        // Parser should produce query = Some(""), NOT None.
+        // Consumers may care about the distinction (e.g., /path vs /path?).
+        let raw = b"GET /path? HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        let req = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("empty query string after ? should parse successfully");
+
+        assert_eq!(req.path, "/path");
+        assert_eq!(req.query, Some(""));
+    }
+
+    #[test]
+    fn from_bytes_head_minimal() {
+        // HEAD is identical to GET but the server must not return a body in the
+        // response. From the *request* parser's perspective, it's just another
+        // method with no body.
+        let raw = b"HEAD / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        let req = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("minimal HEAD request should parse successfully");
+
+        assert!(matches!(req.method, HttpMethod::HEAD));
+        assert_eq!(req.path, "/");
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    /// HTTP/1.0 (RFC 1945) didn't mandate Host, but our parser follow that unconditionally
+    /// HTTP/1.0 requests WITHOUT Host are not rejected.
+    fn from_bytes_http_1_0_no_host() {
+        let raw = b"GET /legacy HTTP/1.0\r\n\r\n";
+
+        let req = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("HTTP/1.0 without Host should parse successfully");
+        assert_eq!(req.host, "");
+    }
+
+
+    /// Non Happy path test cases for from_bytes, ensuring malformed requests are rejected with the incorrect error type
+    #[test]
+    fn from_bytes_missing_host_on_1_1() {
+
+    }
+
+    #[test]
+    fn from_bytes_invalid_http_version() {}
+    #[test]
+    fn from_bytes_malformed_request_line() {}
+    #[test]
+    fn from_bytes_non_integer_content_length() {}
+    
+}
