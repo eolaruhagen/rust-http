@@ -171,6 +171,7 @@ impl<'a> ParsedHttpRequest<'a> {
 
         let (request_line, request_line_end) = extract_request_line(bytes)?;
         let (method, path, query, http_version) = parse_request_line(request_line)?;
+        let is_version_1_0 = http_version == HTTP_VERSION_1_0;
         validate_http_version(http_version)?;
 
         // given the request line at this point we can only assume valid method gives based by the enum, and a valid HTTP version
@@ -184,6 +185,7 @@ impl<'a> ParsedHttpRequest<'a> {
             max_body_size,
             bytes,
             header_end_position,
+            is_version_1_0
         )?;
 
         // once headers are validated and extracted, parse out the well-known headers for direct access, and store the rest in the headers map
@@ -435,8 +437,9 @@ fn validate_http_headers(
     max_body_size: usize,
     buffer: &[u8],
     header_end_position: usize,
+    is_version_1_0: bool,
 ) -> Result<(), SerializationError> {
-    if !header_map.contains_key("host") {
+    if !header_map.contains_key("host") && !is_version_1_0 {
         return Err(SerializationError::InvalidBuffer);
     }
 
