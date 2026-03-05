@@ -8,6 +8,6 @@ pub(super) fn handle(stream: &mut TcpStream, buffsize: usize) {
         Ok(_) => {
             // parse request, and then somehow route to the write handler
         }
-        Err(e) => {}
+        Err(_) => {}
     };
 }
