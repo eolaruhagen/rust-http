@@ -176,7 +176,14 @@ impl<'a> ParsedHttpRequest<'a> {
 
         // given the request line at this point we can only assume valid method gives based by the enum, and a valid HTTP version
         // now we have to create the headers given the header
-        let header_buffer = &bytes[request_line_end + CRLF.len()..header_end_position];
+        let header_start = request_line_end + CRLF.len();
+        let header_buffer = if header_start <= header_end_position {
+            &bytes[header_start..header_end_position]
+        } else {
+            // No headers at all — the request line's \r\n overlaps with the
+            // \r\n\r\n terminator (e.g., "GET / HTTP/1.0\r\n\r\n").
+            b""
+        };
         let header_map = extract_http_headers(header_buffer)?;
         let contains_body = bytes.len() > header_end_position + HEADER_TERMINATOR.len();
         validate_http_headers(
@@ -190,10 +197,11 @@ impl<'a> ParsedHttpRequest<'a> {
 
         // once headers are validated and extracted, parse out the well-known headers for direct access, and store the rest in the headers map
         // Keys are already lowercase — direct .get() is O(1), no case-insensitive scan needed.
-        let host = header_map
-            .get("host")
-            .copied()
-            .ok_or(SerializationError::InvalidBuffer)?; // Host is required in HTTP/1.1
+        let host = match header_map.get("host").copied() {
+            Some(h) => h,
+            None if is_version_1_0 => "", // Host is optional in HTTP/1.0
+            None => return Err(SerializationError::InvalidBuffer), // required in HTTP/1.1
+        };
         let content_length = header_map
             .get("content-length")
             .copied()
