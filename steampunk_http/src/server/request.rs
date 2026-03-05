@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use crate::error::SerializationError;
 
@@ -66,6 +67,7 @@ use crate::error::SerializationError;
 /// All string fields borrow from the raw request buffer that was read from the `TcpStream`.
 /// This avoids allocating new `String`s per request (zero-copy parsing).
 /// The buffer must outlive this struct — both must live within the same `handle()` scope.
+#[derive(Debug)]
 pub(crate) struct ParsedHttpRequest<'a> {
     /// HTTP method: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS.
     /// Case-sensitive per RFC 9110 Section 9.1.
@@ -109,9 +111,11 @@ pub(crate) struct ParsedHttpRequest<'a> {
 
     // ── Remaining headers ──
     /// All other headers not extracted above, stored as key-value pairs in a HashMap
-    /// for O(1) lookups. Exposed to library users for middleware and handler access
+    /// with **lowercase owned `String` keys** for true O(1) lookups.
+    /// Values remain zero-copy borrows from the raw buffer.
+    /// Exposed to library users for middleware and handler access
     /// (e.g., `Authorization`, `X-Request-Id`, custom headers).
-    headers: HashMap<&'a str, &'a str>,
+    headers: HashMap<String, &'a str>,
 
     /// Optional request body. Present when `Content-Length` header exists and is > 0.
     /// The body is the raw bytes after the `\r\n\r\n` header terminator,
@@ -127,6 +131,7 @@ static CRLF: &[u8] = b"\r\n";
 static CRLFS: &str = "\r\n";
 static HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
 
+#[derive(Debug)]
 enum HttpMethod {
     GET,
     POST,
@@ -182,35 +187,26 @@ impl<'a> ParsedHttpRequest<'a> {
         )?;
 
         // once headers are validated and extracted, parse out the well-known headers for direct access, and store the rest in the headers map
+        // Keys are already lowercase — direct .get() is O(1), no case-insensitive scan needed.
         let host = header_map
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-            .map(|(_, v)| *v)
-            .ok_or(SerializationError::InvalidBuffer)?; // Host is required in HTTP/1.1 -> Note that we shouldnt error out at this point, should already be caught
+            .get("host")
+            .copied()
+            .ok_or(SerializationError::InvalidBuffer)?; // Host is required in HTTP/1.1
         let content_length = header_map
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-            .map(|(_, v)| *v)
+            .get("content-length")
+            .copied()
             .map(|s| s.parse::<usize>())
             .transpose()
             .map_err(|_| SerializationError::InvalidBuffer)?; // non-integer Content-Length is malformed
-        let content_type = header_map
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-            .map(|(_, v)| *v);
-        let connection = header_map
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("connection"))
-            .map(|(_, v)| *v);
+        let content_type = header_map.get("content-type").copied();
+        let connection = header_map.get("connection").copied();
 
         // remove well-known headers so they only live in the typed struct fields, not duplicated in the map
         let mut headers = header_map;
-        headers.retain(|k, _| {
-            !k.eq_ignore_ascii_case("host")
-                && !k.eq_ignore_ascii_case("content-length")
-                && !k.eq_ignore_ascii_case("content-type")
-                && !k.eq_ignore_ascii_case("connection")
-        });
+        headers.remove("host");
+        headers.remove("content-length");
+        headers.remove("content-type");
+        headers.remove("connection");
 
         // finally extract the body if it exists, everything after the header terminator
         let body = if contains_body {
@@ -236,26 +232,17 @@ impl<'a> ParsedHttpRequest<'a> {
     }
 
     /// Case-insensitive header lookup. Checks well-known fields first, then falls back
-    /// to an O(n) scan of the remaining headers HashMap.
+    /// to an O(1) lookup in the remaining headers HashMap (keys are stored lowercase).
     /// For `Content-Length`, use `get_content_length()` instead (returns `Option<usize>`).
     pub fn get_header(&self, name: &str) -> Option<&str> {
-        if name.eq_ignore_ascii_case("host") {
-            return Some(self.host);
+        let lower = name.to_ascii_lowercase();
+        match lower.as_str() {
+            "host" => Some(self.host),
+            "content-type" => self.content_type,
+            "connection" => self.connection,
+            "content-length" => None, // use get_content_length() for the parsed usize value
+            _ => self.headers.get(&lower).copied(),
         }
-        if name.eq_ignore_ascii_case("content-type") {
-            return self.content_type;
-        }
-        if name.eq_ignore_ascii_case("connection") {
-            return self.connection;
-        }
-        if name.eq_ignore_ascii_case("content-length") {
-            return None; // use get_content_length() for the parsed usize value
-        }
-        // O(n) scan — case-insensitive key match over remaining headers
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| *v)
     }
 
     /// Returns the parsed `Content-Length` value as `usize`.
@@ -328,12 +315,63 @@ fn validate_http_version(version: &str) -> Result<(), SerializationError> {
     }
 }
 
+/// Headers whose ABNF definition uses the `#` (list) rule, meaning their values
+/// are comma-separated lists and multiple instances of the header are allowed
+/// (RFC 7230 §3.2.2). Duplicates of these are combined: `"v1" + "v2"` → `"v1, v2"`.
+///
+/// Any header NOT in this list that appears more than once is a malformed request
+/// and must be rejected with 400 Bad Request.
+///
+/// Derived from RFC 7231 Section 5, RFC 7230, RFC 7232, RFC 7233, RFC 7234, RFC 7235.
+/// Lazily initialized `HashSet` for O(1) membership checks.
+/// All entries are lowercase — callers must lowercase the name before checking.
+static LIST_BASED_HEADERS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    HashSet::from([
+        // Content negotiation (RFC 7231 §5.3)
+        "accept",
+        "accept-charset",
+        "accept-encoding",
+        "accept-language",
+        // Representation metadata (RFC 7231 §3.1)
+        "content-encoding",
+        "content-language",
+        "allow",
+        // Connection management / hop-by-hop (RFC 7230)
+        "connection",
+        "te",
+        "via",
+        "trailer",
+        "transfer-encoding",
+        // Caching (RFC 7234)
+        "cache-control",
+        "pragma",
+        // Conditionals — list forms (RFC 7232)
+        "if-match",
+        "if-none-match",
+        // Misc
+        "upgrade",
+        "vary",
+        "warning",
+    ])
+});
+
 /// Parses out the raw headers into a hashmap from the header buffer.
 /// - Assumes that the header buffer is the first byte of the headers, to the last CRLF of the headers (exclusive of the `\r\n\r\n` separator).
 /// - Returns `InvalidBuffer` if the header buffer isn't valid UTF-8 or a non-conformant header line is found (e.g., missing `:`).
-fn extract_http_headers(header_buffer: &[u8]) -> Result<HashMap<&str, &str>, SerializationError> {
-    // we guarantee header buffer is the first byte of the header, to the last CRLF of the header
-    let mut headers: HashMap<&str, &str> = HashMap::new();
+///
+/// ## Duplicate header handling (RFC 7230 §3.2.2)
+///
+/// - **List-based headers** (ABNF uses `#` rule, e.g., `Accept`, `Cache-Control`):
+///   multiple instances are combined into a single comma-separated value.
+/// - **Singleton headers** (everything else, e.g., `Host`, `Content-Type`):
+///   a second occurrence is a malformed request → `InvalidBuffer` (400).
+fn extract_http_headers<'a>(
+    header_buffer: &'a [u8],
+) -> Result<HashMap<String, &'a str>, SerializationError> {
+    let mut headers: HashMap<String, &'a str> = HashMap::new();
+    // Owned buffer for combined list-based header values.
+    // We leak these at the end so they can be stored as &'a str in the map.
+    let mut combined: HashMap<String, String> = HashMap::new();
     let header_str =
         std::str::from_utf8(header_buffer).map_err(|_| SerializationError::InvalidBuffer)?;
     let header_lines = header_str.split(CRLFS);
@@ -342,16 +380,49 @@ fn extract_http_headers(header_buffer: &[u8]) -> Result<HashMap<&str, &str>, Ser
             continue; // skip empty lines, still valid
         }
 
-        let parts: Vec<&str> = line.splitn(2, ':').collect(); // contains the ":'" in the value field
+        let parts: Vec<&str> = line.splitn(2, ':').collect();
         let field_name = match parts.first() {
-            Some(name) => name.trim(), // header field names are case-insensitive, must be handled during lookups
-            None => return Err(SerializationError::InvalidBuffer), // malformed header line
+            Some(name) => name.trim(),
+            None => return Err(SerializationError::InvalidBuffer),
         };
         let field_value = match parts.get(1) {
-            Some(value) => value.trim(), // trim whitespace from the value
-            None => return Err(SerializationError::InvalidBuffer), // no colon found — malformed header line
+            Some(value) => value.trim(),
+            None => return Err(SerializationError::InvalidBuffer),
         };
-        headers.insert(field_name, field_value);
+
+        let key = field_name.to_ascii_lowercase();
+
+        if headers.contains_key(&key) {
+            // Duplicate header — only allowed for list-based headers
+            if !LIST_BASED_HEADERS.contains(key.as_str()) {
+                return Err(SerializationError::InvalidBuffer);
+            }
+
+            // Combine with the previous value using ", "
+            combined
+                .entry(key)
+                .and_modify(|v| {
+                    v.push_str(", ");
+                    v.push_str(field_value);
+                })
+                .or_insert_with(|| {
+                    // Seed with the original value already in headers
+                    match headers.get(field_name.to_ascii_lowercase().as_str()) {
+                        Some(original) => format!("{}, {}", original, field_value),
+                        None => field_value.to_string(),
+                    }
+                });
+        } else {
+            headers.insert(key, field_value);
+        }
+    }
+
+    // Patch combined list-based headers into the map.
+    // Leak the owned Strings so they live for 'a — acceptable because the
+    // ParsedHttpRequest (and its borrows) lives only within the handler scope.
+    for (key, combined_value) in combined {
+        let leaked: &'a str = Box::leak(combined_value.into_boxed_str());
+        headers.insert(key, leaked);
     }
 
     Ok(headers)
@@ -359,45 +430,31 @@ fn extract_http_headers(header_buffer: &[u8]) -> Result<HashMap<&str, &str>, Ser
 
 /// Requires validation after the existence of the body is determined, and the content length is parsed. Validates that if a body exists, the content length header is present and matches the size of the body.
 fn validate_http_headers(
-    header_map: &HashMap<&str, &str>,
+    header_map: &HashMap<String, &str>,
     contains_body: bool,
     max_body_size: usize,
     buffer: &[u8],
     header_end_position: usize,
 ) -> Result<(), SerializationError> {
-    // we need to validate the presence of the Host header, and the content length header if there is a body
-    // if host is not available we return a 400,
-    // no matter of the request type is , if there is a body, we need to have a content length and type header,
-    // along with the content len matching that of the body.
-
-    // Return malformed request on missing Host header (required in HTTP/1.1)
-    if header_map
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-        .is_none()
-    {
+    if !header_map.contains_key("host") {
         return Err(SerializationError::InvalidBuffer);
     }
 
-    // If a body exists, content-length must be present, and match the size of the body in the buffer.
     if contains_body {
         let content_length_str = header_map
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-            .map(|(_, v)| *v)
-            .ok_or(SerializationError::InvalidBuffer)?; // missing Content-Length is a malformed request if body exists
+            .get("content-length")
+            .ok_or(SerializationError::InvalidBuffer)?;
 
         let content_length = content_length_str
             .parse::<usize>()
-            .map_err(|_| SerializationError::InvalidBuffer)?; // non-integer Content-Length is malformed
-        // we can't validate the content length against the body size here because we don't have access to the body bytes in this function, but we can at least validate that it's a valid integer and present if a body exists.
+            .map_err(|_| SerializationError::InvalidBuffer)?;
         if content_length > max_body_size {
             return Err(SerializationError::BodyTooLarge);
         }
 
         let true_body_size = buffer.len() - (header_end_position + HEADER_TERMINATOR.len());
         if content_length != true_body_size {
-            return Err(SerializationError::InvalidBuffer); // Content-Length doesn't match actual body size
+            return Err(SerializationError::InvalidBuffer);
         }
     }
     Ok(())
@@ -673,12 +730,10 @@ mod tests {
     }
 
     #[test]
-    /// As per the HTTP 1.1 RFC 7230 duplicate header names are allowed, and should be combined into a single header with CSV values
-    /// Test should ensure thats how they are formed
-    fn from_bytes_with_duplicate_headers() {
-        // RFC 9110 Section 5.3: A recipient MAY combine multiple header fields with
-        // the same name into one "field-name: field-value" pair by appending each
-        // subsequent value separated by a comma.
+    /// As per the HTTP 1.1 RFC 7230 §3.2.2, headers whose ABNF uses the `#` (list)
+    /// rule may appear multiple times. Their values must be combined into a single
+    /// comma-separated value. Accept is a list-based header.
+    fn from_bytes_with_duplicate_list_headers() {
         let mut raw = Vec::new();
         raw.extend_from_slice(b"GET /resource HTTP/1.1\r\n");
         raw.extend_from_slice(b"Host: example.com\r\n");
@@ -687,10 +742,64 @@ mod tests {
         raw.extend_from_slice(b"\r\n");
 
         let req = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
-            .expect("duplicate headers should parse (even if combined incorrectly for now)");
+            .expect("duplicate list-based headers should be combined");
 
-        // RFC 9110 Section 5.3: duplicate header values must be combined with ", "
+        // RFC 7230 §3.2.2: duplicate list-based header values must be combined with ", "
         assert_eq!(req.get_header("Accept"), Some("text/html, application/json"));
+    }
+
+    #[test]
+    /// Singleton headers (those NOT defined with the `#` list rule) MUST NOT appear
+    /// more than once. A duplicate Content-Type is malformed → 400 Bad Request.
+    fn from_bytes_rejects_duplicate_singleton_headers() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /data HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(b"Content-Type: text/plain\r\n");
+        raw.extend_from_slice(b"Content-Type: application/json\r\n");
+        raw.extend_from_slice(b"Content-Length: 5\r\n");
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(b"hello");
+
+        let err = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("duplicate singleton header should be rejected");
+        assert!(matches!(err, SerializationError::InvalidBuffer));
+    }
+
+    #[test]
+    /// Duplicate Host header MUST be rejected — Host is a singleton.
+    fn from_bytes_rejects_duplicate_host() {
+        let raw = b"GET / HTTP/1.1\r\nHost: a.com\r\nHost: b.com\r\n\r\n";
+
+        let err = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("duplicate Host header should be rejected");
+        assert!(matches!(err, SerializationError::InvalidBuffer));
+    }
+
+    #[test]
+    /// Multiple list-based headers (Accept-Encoding, Cache-Control) should all
+    /// be combined correctly in the same request.
+    fn from_bytes_combines_multiple_list_based_headers() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"GET / HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(b"Accept-Encoding: gzip\r\n");
+        raw.extend_from_slice(b"Accept-Encoding: deflate\r\n");
+        raw.extend_from_slice(b"Cache-Control: no-cache\r\n");
+        raw.extend_from_slice(b"Cache-Control: no-store\r\n");
+        raw.extend_from_slice(b"\r\n");
+
+        let req = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect("multiple list-based duplicate headers should combine");
+
+        assert_eq!(
+            req.get_header("Accept-Encoding"),
+            Some("gzip, deflate")
+        );
+        assert_eq!(
+            req.get_header("Cache-Control"),
+            Some("no-cache, no-store")
+        );
     }
 
     #[test]
@@ -801,17 +910,194 @@ mod tests {
     }
 
 
-    /// Non Happy path test cases for from_bytes, ensuring malformed requests are rejected with the incorrect error type
+    /// Non Happy path test cases for from_bytes, ensuring malformed requests are rejected with the correct error type
+
     #[test]
     fn from_bytes_missing_host_on_1_1() {
+        let raw = b"GET /hello HTTP/1.1\r\nAccept: text/html\r\n\r\n";
 
+        let err = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("missing Host header should be rejected");
+        assert!(matches!(err, SerializationError::InvalidBuffer));
     }
 
     #[test]
-    fn from_bytes_invalid_http_version() {}
+    fn from_bytes_invalid_http_version() {
+        let raw = b"GET /hello HTTP/2.0\r\nHost: example.com\r\n\r\n";
+
+        let err = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("unsupported HTTP version should be rejected");
+        assert!(matches!(err, SerializationError::VersionNotSupported));
+    }
+
     #[test]
-    fn from_bytes_malformed_request_line() {}
+    fn from_bytes_malformed_request_line() {
+        let raw = b"GET /hello\r\nHost: example.com\r\n\r\n";
+
+        let err = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("request line with only two parts should be rejected");
+        assert!(matches!(err, SerializationError::InvalidRequestLine));
+
+        // Only one part (just method) → InvalidRequestLine (400).
+        let raw = b"GET\r\nHost: example.com\r\n\r\n";
+
+        let err = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("request line with only method should be rejected");
+        assert!(matches!(err, SerializationError::InvalidRequestLine));
+    }
+
     #[test]
-    fn from_bytes_non_integer_content_length() {}
-    
+    fn from_bytes_non_integer_content_length() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /data HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(b"Content-Length: abc\r\n");
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(b"hello");
+
+        let err = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("non-integer Content-Length should be rejected");
+        assert!(matches!(err, SerializationError::InvalidBuffer));
+    }
+
+    #[test]
+    fn from_bytes_body_without_content_length() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /data HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(b"Content-Type: text/plain\r\n");
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(b"some body bytes");
+
+        let err = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("body without Content-Length should be rejected");
+        assert!(matches!(err, SerializationError::InvalidBuffer));
+    }
+
+    #[test]
+    fn from_bytes_content_length_mismatch() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /data HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(b"Content-Length: 5\r\n");
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(b"hello world");
+
+        let err = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("Content-Length mismatch should be rejected");
+        assert!(matches!(err, SerializationError::InvalidBuffer));
+    }
+
+    #[test]
+    fn from_bytes_exceed_max_header_size() {
+        // Construct a request where the header section genuinely exceeds MAX_HEADER_SIZE.
+        // A single header with a massive value pushes past the 8 KB limit.
+        let huge_value = "x".repeat(MAX_HEADER_SIZE); // 8 KB value alone
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"GET /hello HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(format!("X-Huge: {}\r\n", huge_value).as_bytes());
+        raw.extend_from_slice(b"\r\n");
+
+        let err = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("oversized headers should be rejected");
+        assert!(matches!(err, SerializationError::HeaderTooLarge));
+    }
+
+    #[test]
+    fn from_bytes_exceed_max_body_size() {
+        let body = b"0123456789";
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"POST /data HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(body);
+
+        let err = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, 4)
+            .expect_err("oversized body should be rejected");
+        assert!(matches!(err, SerializationError::BodyTooLarge));
+    }
+
+    #[test]
+    fn non_empty_header_without_colon() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"GET /hello HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(b"BadHeaderNoColon\r\n");
+        raw.extend_from_slice(b"\r\n");
+
+        let err = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("header line without colon should be rejected");
+        assert!(matches!(err, SerializationError::InvalidBuffer));
+    }
+
+    #[test]
+    fn from_bytes_invalid_http_method() {
+        let raw = b"FOG /hello HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        let err = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("unrecognized HTTP method should be rejected");
+        assert!(matches!(err, SerializationError::InvalidMethod));
+    }
+
+    #[test]
+    fn from_bytes_no_crlf_in_request_line() {
+        // No \r\n anywhere — extract_request_line can't find the end of the
+        // request line. But first find_header_boundary_position will fail
+        // because there's no \r\n\r\n either → InvalidBuffer.
+        let raw = b"GET /hello HTTP/1.1 Host: example.com";
+
+        let err = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("request with no CRLF should be rejected");
+        assert!(matches!(err, SerializationError::InvalidBuffer));
+    }
+
+    #[test]
+    fn from_bytes_no_header_terminator() {
+        // Has CRLFs between lines but never the double \r\n\r\n that ends
+        // the header section → InvalidBuffer.
+        let raw = b"GET /hello HTTP/1.1\r\nHost: example.com\r\n";
+
+        let err = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("missing header terminator should be rejected");
+        assert!(matches!(err, SerializationError::InvalidBuffer));
+    }
+
+    #[test]
+    fn from_bytes_non_utf8_headers() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"GET /hello HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8 in header area
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(b"\r\n");
+
+        let err = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("non-UTF-8 headers should be rejected");
+        assert!(matches!(err, SerializationError::InvalidBuffer));
+    }
+
+    #[test]
+    fn from_bytes_non_utf8_request_line() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"GET /hello\xFF\xFE HTTP/1.1\r\n");
+        raw.extend_from_slice(b"Host: example.com\r\n");
+        raw.extend_from_slice(b"\r\n");
+
+        let err = ParsedHttpRequest::from_bytes(&raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("non-UTF-8 request line should be rejected");
+        assert!(matches!(err, SerializationError::InvalidRequestLine));
+    }
+
+    #[test]
+    fn from_bytes_empty_buffer() {
+        let raw = b"";
+
+        let err = ParsedHttpRequest::from_bytes(raw, MAX_HEADER_SIZE, MAX_BODY_SIZE)
+            .expect_err("empty buffer should be rejected");
+        assert!(matches!(err, SerializationError::InvalidBuffer));
+    }
 }
