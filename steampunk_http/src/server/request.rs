@@ -221,8 +221,12 @@ impl<'a> ParsedHttpRequest<'a> {
         // finally extract the body if it exists, everything after the header terminator
         let body = if contains_body {
             let body_start = header_end_position + HEADER_TERMINATOR.len();
-            // unwrap safe — validate_http_headers guarantees content_length exists when contains_body is true
-            Some(&bytes[body_start..body_start + content_length.unwrap()])
+            let len = content_length.ok_or(SerializationError::InvalidBuffer)?;
+            let body_end = body_start.checked_add(len)
+                // maybe an un-needed filter here? but we must confirm its a valid buffer slice
+                .filter(|&end| end <= bytes.len())
+                .ok_or(SerializationError::InvalidBuffer)?;
+            Some(&bytes[body_start..body_end])
         } else {
             None
         };
